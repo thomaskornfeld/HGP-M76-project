@@ -216,11 +216,34 @@ def main():
     stats = {}
     for fname, data, title in variance_panels:
         fig, ax = plt.subplots(figsize=(7, 5.5))
-        vmin = max(data[data > 0].min(), 1e-12)
-        vmax = data.max()
-        pcm = ax.pcolormesh(FQ, FP, data, shading='auto', cmap='inferno',
-                            norm=LogNorm(vmin=vmin, vmax=vmax))
-        fig.colorbar(pcm, ax=ax, shrink=0.85, label='Variance')
+
+        # Detect near-constant panels (e.g. RBF prior, which is exactly
+        # flat up to floating-point noise) and pad the color range so
+        # the true value is centered and visibly labeled, rather than
+        # letting LogNorm stretch machine-epsilon noise across the
+        # full color scale.
+        data_mean = data.mean()
+        relative_spread = (data.max() - data.min()) / max(abs(data_mean), 1e-300)
+
+        if relative_spread < 1e-6:
+            # Effectively constant: pad ±5% around the true value so
+            # it renders as one solid, correctly-labeled color.
+            vmin = data_mean * 0.90
+            vmax = data_mean * 1.10
+            pcm = ax.pcolormesh(FQ, FP, np.full_like(data, data_mean),
+                                shading='auto', cmap='inferno',
+                                norm=LogNorm(vmin=vmin, vmax=vmax))
+            cbar = fig.colorbar(pcm, ax=ax, shrink=0.85, label='Variance')
+            # Force a tick exactly at the true constant value
+            cbar.set_ticks([data_mean])
+            cbar.set_ticklabels([f'{data_mean:.4e}'])
+        else:
+            vmin = max(data[data > 0].min(), 1e-12)
+            vmax = data.max()
+            pcm = ax.pcolormesh(FQ, FP, data, shading='auto', cmap='inferno',
+                                norm=LogNorm(vmin=vmin, vmax=vmax))
+            fig.colorbar(pcm, ax=ax, shrink=0.85, label='Variance')
+
         ax.contour(FQ, FP, H_true, levels=[0], colors='cyan',
                    linewidths=1.5, linestyles='--')
         ax.scatter(Z_est[:, 0], Z_est[:, 1], s=6, c='white', alpha=0.4, zorder=5)
