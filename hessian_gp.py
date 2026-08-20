@@ -144,33 +144,32 @@ def build_hessian_gram(kernel, Z, d4_fn):
     """
     Build the 3N × 3N Gram matrix for Hessian observations.
     Vectorised: computes all (a,b,c,d) blocks in one pass per inducing point.
+
+    D²φ_s(u) = ([Σ^{-1}u]_a [Σ^{-1}u]_b − [Σ^{-1}]_{ab}) φ(u)
+    where (a,b) = IDX_PAIRS[s].  Works for full (non-diagonal) Σ^{-1}.
     """
     N = len(Z)
     K = np.zeros((3*N, 3*N))
 
     if hasattr(kernel, 'log_lam'):
-        # NKN: exploit separable structure for speed
         for ii in range(kernel.M):
             lam = np.exp(kernel.log_lam[ii])
-            ell = np.exp(kernel.log_ell[ii])
+            Sinv = kernel._get_Sinv(ii)
             p = kernel.centers[ii]
 
-            U = Z - p                              # (N, 2)
-            phi = np.exp(-0.5 * np.sum((U/ell)**2, axis=1))  # (N,)
+            U = Z - p                                     # (N, 2)
+            SU = U @ Sinv                                  # (N, 2) = Σ^{-1}u per row
+            phi = np.exp(-0.5 * np.sum(U * SU, axis=1))   # (N,)
 
-            # Precompute D²φ components for all points
-            # D2[i, a, b] = (u_a u_b/(ℓ_a² ℓ_b²) − δ_{ab}/ℓ_a²) φ_i
-            D2 = np.zeros((N, 3))  # indices: qq, qp, pp
+            # D2[n, s] = ([Sinv u]_a [Sinv u]_b − Sinv_{ab}) φ(u_n)
+            D2 = np.zeros((N, 3))
             for s, (a, b) in enumerate(IDX_PAIRS):
-                D2[:, s] = (U[:, a]*U[:, b]/(ell[a]**2*ell[b]**2)
-                            - (1.0 if a==b else 0.0)/ell[a]**2) * phi
+                D2[:, s] = (SU[:, a] * SU[:, b] - Sinv[a, b]) * phi
 
-            # Outer product: K_block[3i+s, 3j+t] += lam * D2[i,s] * D2[j,t]
             for s in range(3):
                 for t in range(3):
                     K[s::3, t::3] += lam * np.outer(D2[:, s], D2[:, t])
     else:
-        # RBF: use the general loop
         for i in range(N):
             for j in range(N):
                 for s in range(3):
@@ -190,18 +189,22 @@ def build_H_cross(kernel, Z_test, Z_train, d2_fn):
     if hasattr(kernel, 'log_lam'):
         for ii in range(kernel.M):
             lam = np.exp(kernel.log_lam[ii])
-            ell = np.exp(kernel.log_ell[ii])
+            Sinv = kernel._get_Sinv(ii)
             p = kernel.centers[ii]
 
             U_test = Z_test - p
             U_train = Z_train - p
-            phi_test = np.exp(-0.5*np.sum((U_test/ell)**2, axis=1))  # (M_test,)
-            phi_train = np.exp(-0.5*np.sum((U_train/ell)**2, axis=1))  # (N,)
+
+            SU_test = U_test @ Sinv
+            SU_train = U_train @ Sinv
+
+            phi_test = np.exp(-0.5 * np.sum(U_test * SU_test, axis=1))
+            phi_train = np.exp(-0.5 * np.sum(U_train * SU_train, axis=1))
 
             D2_train = np.zeros((N, 3))
             for s, (c, d) in enumerate(IDX_PAIRS):
-                D2_train[:, s] = (U_train[:,c]*U_train[:,d]/(ell[c]**2*ell[d]**2)
-                                  - (1.0 if c==d else 0.0)/ell[c]**2) * phi_train
+                D2_train[:, s] = (SU_train[:, c] * SU_train[:, d]
+                                  - Sinv[c, d]) * phi_train
 
             for t in range(3):
                 K_cross[:, t::3] += lam * np.outer(phi_test, D2_train[:, t])

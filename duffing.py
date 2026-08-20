@@ -75,37 +75,58 @@ def estimate_hessian_field(grid_q, grid_p, dt_jac=0.1,
     Hqq = np.zeros(M)
     Hqp = np.zeros(M)
     Hpp = np.zeros(M)
-    mean_vel = np.zeros((M, 2))   # mean velocity ≈ J∇H(z₀)
+    mean_vel = np.zeros((M, 2))
+    noise_hess = np.zeros((M, 3, 3))   # per-point 3×3 Hessian noise cov
+    noise_grad = np.zeros((M, 2, 2))   # per-point 2×2 gradient noise cov
 
     for i in range(M):
         z0 = Z_grid[i]
         z0_T = integrate(z0, dt_jac)
-
-        # Mean velocity at z₀ (from nominal trajectory, no perturbation)
         mean_vel[i] = (z0_T - z0) / dt_jac
 
-        # Draw perturbations and integrate
         E = rng.normal(0, eps_std, size=(n_eps, 2))
         D = np.zeros((n_eps, 2))
         for j in range(n_eps):
             z_pert_T = integrate(z0 + E[j], dt_jac)
             D[j] = z_pert_T - z0_T
 
-        # Least-squares: D ≈ E @ DPhi^T  →  DPhi^T = pinv(E) @ D
-        DPhi_T = np.linalg.lstsq(E, D, rcond=None)[0]   # (2, 2)
-        DPhi = DPhi_T.T                                    # (2, 2)
-
-        # Extract A = (DPhi - I) / dt
+        # OLS for M
+        DPhi_T = np.linalg.lstsq(E, D, rcond=None)[0]
+        DPhi = DPhi_T.T
         A = (DPhi - np.eye(2)) / dt_jac
-
-        # ∇²H = -J @ A  (since A = J ∇²H → ∇²H = J^{-1} A = -J A)
         H2 = -J_mat @ A
-        # H2 should be symmetric; average off-diagonals
         Hqq[i] = H2[0, 0]
         Hpp[i] = H2[1, 1]
         Hqp[i] = 0.5 * (H2[0, 1] + H2[1, 0])
 
-    return Z_grid, Hqq, Hqp, Hpp, mean_vel
+        # ── Empirical noise covariance from residual outer products ──
+        residuals = D - E @ DPhi_T            # r_i = Δ_i − M̂ ε_i
+        C = residuals.T @ residuals / max(n_eps - 2, 1)  # 2×2
+        S = np.linalg.inv(E.T @ E)            # 2×2
+
+        # 3×3 Hessian noise cov (from formulas in the paper)
+        dt2 = dt_jac**2
+        noise_hess[i, 0, 0] = C[1,1] * S[0,0] / dt2             # Var(Hqq)
+        noise_hess[i, 1, 1] = (C[0,0]*S[0,0] + C[1,1]*S[1,1]
+                                - 2*C[0,1]*S[0,1]) / (4*dt2)     # Var(Hqp)
+        noise_hess[i, 2, 2] = C[0,0] * S[1,1] / dt2             # Var(Hpp)
+        noise_hess[i, 0, 1] = (-C[0,1]*S[0,0] + C[1,1]*S[0,1]) / (2*dt2)
+        noise_hess[i, 1, 0] = noise_hess[i, 0, 1]
+        noise_hess[i, 0, 2] = -C[0,1] * S[0,1] / dt2
+        noise_hess[i, 2, 0] = noise_hess[i, 0, 2]
+        noise_hess[i, 1, 2] = (C[0,0]*S[0,1] - C[0,1]*S[1,1]) / (2*dt2)
+        noise_hess[i, 2, 1] = noise_hess[i, 1, 2]
+
+        # 2×2 gradient noise cov (sample covariance of individual ∇H estimates)
+        grad_samples = np.column_stack([
+            -(z0_T[1] + (D[:, 1] + z0_T[1] - z0[1])) / dt_jac,  # −ṗ per sample
+            (z0_T[0] + (D[:, 0] + z0_T[0] - z0[0])) / dt_jac     # q̇ per sample
+        ])  # each row is one ∇H estimate from one ε_i... 
+        # Actually simpler: use plug-in with estimated Hessian
+        H2_est = np.array([[Hqq[i], Hqp[i]], [Hqp[i], Hpp[i]]])
+        noise_grad[i] = H2_est @ (eps_std**2 * np.eye(2)) @ H2_est.T / n_eps
+
+    return Z_grid, Hqq, Hqp, Hpp, mean_vel, noise_hess, noise_grad
 
 
 # ─── Noisy velocity observations for GP kernel comparison ────────────────────

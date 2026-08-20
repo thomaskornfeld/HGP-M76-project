@@ -30,7 +30,7 @@ def fit(kernel, X, y, max_iter=200, verbose=True):
             print(f"      iter {calls[0]:5d}  NLL={v:.2f}")
         return v
     res = minimize(obj, p0, method='L-BFGS-B',
-                   options={'maxiter': max_iter, 'ftol': 1e-9})
+                   options={'maxiter': max_iter, 'maxfun': max(15000, max_iter*50), 'ftol': 1e-9})
     kernel.set_params(res.x)
     if verbose:
         print(f"      Done: NLL={res.fun:.2f} ({res.success})")
@@ -81,7 +81,7 @@ def fit_heteroscedastic(kernel, X, y, noise_var_per_point, max_iter=200,
         return val
 
     res = minimize(obj, p0, method='L-BFGS-B',
-                   options={'maxiter': max_iter, 'ftol': 1e-9})
+                   options={'maxiter': max_iter, 'maxfun': max(15000, max_iter*50), 'ftol': 1e-9})
     kernel.set_params(res.x)
     if verbose:
         print(f"      Done: NLL={res.fun:.2f} ({res.success})")
