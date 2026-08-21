@@ -295,7 +295,76 @@ def joint_fit_empirical(kernel, Z, y, noise_matrix, max_iter=300,
     return res
 
 
-def predict_H_empirical(kernel, Z_train, y, Z_test, noise_matrix, jitter=1e-4):
+def predict_grad_empirical(kernel, Z_train, y, Z_test, noise_matrix,
+                           component, jitter=1e-4):
+    """
+    Posterior mean and variance of ∂H/∂z_component at test points.
+
+    component=0 → ∂qH (= -ṗ),  component=1 → ∂pH (= q̇).
+
+    Cross-cov: Cov[D_s H(z*), D_t H(z_j)] = Σ_r λ_r D_s φ_r(z*-p_r) D_t φ_r(z_j-p_r)
+    where s indexes the gradient component (0 or 1) at the test point.
+    """
+    N = len(Z_train)
+    K = build_gram(kernel, Z_train) + noise_matrix + jitter * np.eye(len(y))
+
+    try:
+        L, lower = cho_factor(K, lower=True)
+        alpha = cho_solve((L, lower), y)
+        solve_fn = lambda b: cho_solve((L, lower), b)
+    except np.linalg.LinAlgError:
+        eigvals, eigvecs = np.linalg.eigh(K)
+        eigvals = np.maximum(eigvals, 1e-6)
+        alpha = eigvecs @ (np.diag(1.0/eigvals) @ (eigvecs.T @ y))
+        solve_fn = lambda b: eigvecs @ (np.diag(1.0/eigvals) @ (eigvecs.T @ b))
+
+    M_test = len(Z_test)
+
+    if hasattr(kernel, 'log_lam'):
+        # NKN fast path
+        Ds_train, _ = _nkn_deriv_matrix(kernel, Z_train)
+        Ds_test, _ = _nkn_deriv_matrix(kernel, Z_test)
+        lam = np.exp(kernel.log_lam)
+
+        # Cross-cov: Cov[D_component H(z*), D_t H(z_j)]
+        # = Σ_r λ_r D_component φ_r(z*-p_r) D_t φ_r(z_j-p_r)
+        K_cross = np.zeros((M_test, N_OBS * N))
+        for t in range(N_OBS):
+            A = Ds_test[:, component, :] * lam[np.newaxis, :]
+            B = Ds_train[:, t, :]
+            K_cross[:, t::N_OBS] = A @ B.T
+
+        # Prior variance of ∂_component H: k_{ss}(z*,z*)
+        # = Σ_r λ_r [D_component φ_r(z*-p_r)]²
+        k_diag = np.sum(Ds_test[:, component, :]**2 * lam[np.newaxis, :], axis=1)
+    else:
+        # RBF: use Hermite derivatives
+        # Prior var of ∂_a H = ∂²k/∂z_a∂z'_a|_{z=z'} = σ_f²/ℓ² (always)
+        k_diag = np.full(M_test, kernel.sigma_f**2 / kernel.ell**2)
+
+        # Cross-cov via Hermite: D_component^L D_t^R k(z*, z_j)
+        # The test-point derivative is first-order (component 0 or 1)
+        # Combined with observation type t on the training side
+        K_cross = np.zeros((M_test, N_OBS * N))
+        for t in range(N_OBS):
+            mt_left, nt_left = [(1,0),(0,1)][component]  # test derivative
+            mt_right, nt_right = _MULTI[t]                 # train derivative
+            m_tot = mt_left + mt_right
+            n_tot = nt_left + nt_right
+            order_tot = m_tot + n_tot
+            sign = (-1)**_ORDER[t] * (-1)**order_tot
+            Dq = Z_test[:, 0:1] - Z_train[:, 0:1].T
+            Dp = Z_test[:, 1:2] - Z_train[:, 1:2].T
+            U = Dq / kernel.ell; V = Dp / kernel.ell
+            K_base = kernel.sigma_f**2 * np.exp(-0.5*(U**2+V**2))
+            scale = 1.0 / kernel.ell**order_tot
+            block = sign * scale * _hermite(m_tot, U) * _hermite(n_tot, V) * K_base
+            K_cross[:, t::N_OBS] = block
+
+    mu = K_cross @ alpha
+    V = solve_fn(K_cross.T)
+    var = k_diag - np.sum(K_cross.T * V, axis=0)
+    return mu, np.clip(var, 0, None)
     """Predict H with empirical per-point noise (no fitted noise params)."""
     K = build_gram(kernel, Z_train) + noise_matrix + jitter * np.eye(len(y))
     try:
@@ -401,4 +470,28 @@ def predict_H(kernel, Z_train, y, Z_test, sigma_grad, sigma_hess, jitter=1e-4):
     V = solve_fn(K_cross.T)
     var_H = k_diag - np.sum(K_cross.T * V, axis=0)
 
+    return mu_H, np.clip(var_H, 0, None)
+
+
+def predict_H_empirical(kernel, Z_train, y, Z_test, noise_matrix, jitter=1e-4):
+    """Predict H with empirical per-point noise (no fitted noise params)."""
+    K = build_gram(kernel, Z_train) + noise_matrix + jitter * np.eye(len(y))
+    try:
+        L, lower = cho_factor(K, lower=True)
+        alpha = cho_solve((L, lower), y)
+        solve_fn = lambda b: cho_solve((L, lower), b)
+    except np.linalg.LinAlgError:
+        eigvals, eigvecs = np.linalg.eigh(K)
+        eigvals = np.maximum(eigvals, 1e-6)
+        alpha = eigvecs @ (np.diag(1.0/eigvals) @ (eigvecs.T @ y))
+        solve_fn = lambda b: eigvecs @ (np.diag(1.0/eigvals) @ (eigvecs.T @ b))
+
+    K_cross = build_H_cross(kernel, Z_test, Z_train)
+    mu_H = K_cross @ alpha
+
+    M_test = len(Z_test)
+    k_diag = np.array([kernel.gram(Z_test[m:m+1], Z_test[m:m+1])[0, 0]
+                        for m in range(M_test)])
+    V = solve_fn(K_cross.T)
+    var_H = k_diag - np.sum(K_cross.T * V, axis=0)
     return mu_H, np.clip(var_H, 0, None)

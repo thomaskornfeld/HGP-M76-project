@@ -82,13 +82,23 @@ def estimate_hessian_field(grid_q, grid_p, dt_jac=0.1,
     for i in range(M):
         z0 = Z_grid[i]
         z0_T = integrate(z0, dt_jac)
-        mean_vel[i] = (z0_T - z0) / dt_jac
 
+        # Draw perturbations
         E = rng.normal(0, eps_std, size=(n_eps, 2))
         D = np.zeros((n_eps, 2))
+
+        # ── Gradient estimate: average of perturbed trajectories ─────────
+        # ∇̂H = -J · (1/n) Σ_i [U(z₀+ε_i; dt) - z₀] / dt
+        # This is the estimator from Section 4.1 of the paper.
+        mean_perturbed_vel = np.zeros(2)
         for j in range(n_eps):
             z_pert_T = integrate(z0 + E[j], dt_jac)
             D[j] = z_pert_T - z0_T
+            mean_perturbed_vel += (z_pert_T - z0) / dt_jac
+        mean_perturbed_vel /= n_eps
+
+        # Store raw velocity (caller applies -J to get ∇H)
+        mean_vel[i] = mean_perturbed_vel
 
         # OLS for M
         DPhi_T = np.linalg.lstsq(E, D, rcond=None)[0]
@@ -117,14 +127,12 @@ def estimate_hessian_field(grid_q, grid_p, dt_jac=0.1,
         noise_hess[i, 1, 2] = (C[0,0]*S[0,1] - C[0,1]*S[1,1]) / (2*dt2)
         noise_hess[i, 2, 1] = noise_hess[i, 1, 2]
 
-        # 2×2 gradient noise cov (sample covariance of individual ∇H estimates)
-        grad_samples = np.column_stack([
-            -(z0_T[1] + (D[:, 1] + z0_T[1] - z0[1])) / dt_jac,  # −ṗ per sample
-            (z0_T[0] + (D[:, 0] + z0_T[0] - z0[0])) / dt_jac     # q̇ per sample
-        ])  # each row is one ∇H estimate from one ε_i... 
-        # Actually simpler: use plug-in with estimated Hessian
+        # 2×2 gradient noise cov from Section 4.1:
+        # Cov(∇̂H) = (1/n)(Hess H - J/dt) Cov(ε) (Hess H - J/dt)^T
+        # Using plug-in Hessian estimate and known Cov(ε) = σ²I
         H2_est = np.array([[Hqq[i], Hqp[i]], [Hqp[i], Hpp[i]]])
-        noise_grad[i] = H2_est @ (eps_std**2 * np.eye(2)) @ H2_est.T / n_eps
+        coeff = H2_est - J_mat / dt_jac   # (Hess H - J/dt)
+        noise_grad[i] = (eps_std**2 / n_eps) * coeff @ coeff.T
 
     return Z_grid, Hqq, Hqp, Hpp, mean_vel, noise_hess, noise_grad
 

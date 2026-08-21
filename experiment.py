@@ -22,6 +22,7 @@ from kernels import RBFKernel, NKNKernel
 from gp import fit, predict
 from hamiltonian_gp import (stack_observations, build_noise_matrix,
                             joint_fit_empirical, predict_H_empirical,
+                            predict_grad_empirical, _nkn_deriv_matrix,
                             joint_fit, predict_H,
                             build_gram, noise_diag)
 
@@ -32,14 +33,14 @@ FIGDIR = 'figures/'
 Q_RANGE = (-1.6, 1.6)
 P_RANGE = (-1.0, 1.0)
 
-N_EST_Q, N_EST_P = 8, 6
-DT_JAC   = 0.1
-N_EPS    = 40
-EPS_STD  = 0.02
+N_EST_Q, N_EST_P = 7, 7
+DT_JAC   = 0.2
+N_EPS    = 30
+EPS_STD  = 0.05
 
 N_FINE_Q, N_FINE_P = 35, 28
-NKN_NQ, NKN_NP = 4, 3
-MAX_ITER = 300
+NKN_NQ, NKN_NP = 4,4
+MAX_ITER = 5_00
 
 PDF_T = 2.0; PDF_SIGMA = 0.08; PDF_N_SAMPLES = 400; PDF_N_SAVE = 6
 
@@ -232,11 +233,12 @@ def main():
             vmax = data_mean * 1.10
             pcm = ax.pcolormesh(FQ, FP, np.full_like(data, data_mean),
                                 shading='auto', cmap='inferno',
-                                norm=LogNorm(vmin=vmin, vmax=vmax))
+                                norm=Normalize(vmin=vmin, vmax=vmax))
             cbar = fig.colorbar(pcm, ax=ax, shrink=0.85, label='Variance')
-            # Force a tick exactly at the true constant value
+            # Show ONLY the true constant value as a tick (no auto ticks)
             cbar.set_ticks([data_mean])
             cbar.set_ticklabels([f'{data_mean:.4e}'])
+            cbar.ax.minorticks_off()
         else:
             vmin = max(data[data > 0].min(), 1e-12)
             vmax = data.max()
@@ -364,12 +366,61 @@ Ratio (RBF/NKN) Post.\ Mean & \multicolumn{4}{c}{%.1f$\times$} \\
     sc = ax.scatter(nkn.centers[:, 0], nkn.centers[:, 1],
                     c=amps, s=60, cmap='plasma', edgecolors='k', zorder=5)
     plt.colorbar(sc, ax=ax, label='Amplitude λ_i')
-    ax.set_xlim(-2.2, 2.2); ax.set_ylim(-1.5, 1.5)
+    ax.set_xlim(-2.2*1.5, 2.2*1.5); ax.set_ylim(-1.5*1.5, 1.5*1.5)
     ax.set_title('NKN: Anisotropic Inducing Points', fontsize=13)
     ax.set_xlabel('q'); ax.set_ylabel('p')
     fig.tight_layout()
     fig.savefig(f'{FIGDIR}/nkn_structure.png', dpi=150); plt.close(fig)
     print("  → nkn_structure.png")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Velocity variance from the Hamiltonian GP: Var[q̇] and Var[ṗ]
+    # q̇ = ∂pH, ṗ = -∂qH → Var[q̇] = Var[∂pH], Var[ṗ] = Var[∂qH]
+    # ══════════════════════════════════════════════════════════════════════
+    from hamiltonian_gp import predict_grad_empirical
+
+    vel_var = {}  # {(kernel_name, 'qdot'/'pdot', 'prior'/'posterior'): array}
+
+    for name, kern in [('NKN', nkn), ('RBF', rbf)]:
+        for comp, comp_idx, label in [(1, 1, 'qdot'), (0, 0, 'pdot')]:
+            # comp=1 → ∂pH = q̇,  comp=0 → ∂qH = -ṗ (Var same)
+            mu_g, var_g = predict_grad_empirical(
+                kern, Z_est, y, Z_fine, noise_mat, comp_idx)
+            vel_var[(name, label, 'posterior')] = var_g
+
+            # Prior: k_{∂a,∂a}(z,z)
+            if hasattr(kern, 'log_lam'):
+                Ds_fine, _ = _nkn_deriv_matrix(kern, Z_fine)
+                lam = np.exp(kern.log_lam)
+                prior = np.sum(Ds_fine[:, comp_idx, :]**2 * lam[np.newaxis,:], axis=1)
+            else:
+                prior = np.full(len(Z_fine), kern.sigma_f**2 / kern.ell**2)
+            vel_var[(name, label, 'prior')] = prior
+
+    # ── 2×4 grid: rows = qdot/pdot, cols = RBF prior / RBF post / NKN prior / NKN post
+    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+    for row, comp in enumerate(['qdot', 'pdot']):
+        comp_label = r'$\dot{q}$' if comp == 'qdot' else r'$\dot{p}$'
+        for col, (kname, stage) in enumerate([
+                ('RBF','prior'), ('RBF','posterior'),
+                ('NKN','prior'), ('NKN','posterior')]):
+            ax = axes[row, col]
+            v = vel_var[(kname, comp, stage)].reshape(fine_shape)
+            vmin = max(v[v>0].min(), 1e-12); vmax = v.max()
+            pcm = ax.pcolormesh(FQ, FP, v, shading='auto', cmap='inferno',
+                                norm=LogNorm(vmin=vmin, vmax=vmax))
+            fig.colorbar(pcm, ax=ax, shrink=0.85)
+            ax.contour(FQ, FP, H_true, levels=[0], colors='cyan',
+                       linewidths=1.2, linestyles='--')
+            ax.set_title(f'{kname} {stage} Var[{comp_label}]', fontsize=11)
+            ax.set_xlabel('q'); ax.set_ylabel('p')
+
+    fig.suptitle(r'Velocity Variance from Hamiltonian GP: Prior and Posterior for $\dot{q}$ and $\dot{p}$',
+                 fontsize=14, y=1.02)
+    fig.tight_layout()
+    fig.savefig(f'{FIGDIR}/velocity_var_from_H.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print("  → velocity_var_from_H.png")
 
     # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
